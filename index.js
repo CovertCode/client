@@ -96,12 +96,12 @@ app.post('/api/v1/commands', requireAuth, async (req, res) => {
 // We generate a temporary cert in memory or require a basic one. 
 // For simplicity, let's assume you still have the basic 'target-node.key/crt' 
 // OR generate them once. Using HTTP is unsafe for API Keys.
-const TLS_OPTS = {
-    key: fs.readFileSync('../certs/target-node.key'), // Keep the basic SSL certs
-    cert: fs.readFileSync('../certs/target-node.crt'),
-    // REMOVED: requestCert, rejectUnauthorized, ca (No mTLS)
-};
+// const TLS_OPTS = {
+//     key: fs.readFileSync('../certs/target-node.key'), // Keep the basic SSL certs
+//     cert: fs.readFileSync('../certs/target-node.crt'),
+//     // REMOVED: requestCert, rejectUnauthorized, ca (No mTLS)
+// };
 
-https.createServer(TLS_OPTS, app).listen(8443, () => {
+https.createServer(app).listen(8443, () => {
     console.log('Client listening on port 8443 (HTTPS enabled, API Key protection active)');
 });
