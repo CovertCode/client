@@ -5,9 +5,13 @@ import express from 'express'; // Pure Express
 import helmet from 'helmet';
 import pm2 from 'pm2';
 import { fileURLToPath } from 'url';
+import * as pluginManager from './services/plugin_loader.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
+
+// 1. Initialize Plugins on Start
+await pluginManager.loadPlugins();
 
 // Security Middleware
 app.use(helmet());
@@ -63,9 +67,26 @@ app.get('/health', requireAuth, async (req, res) => {
             memory: proc.monit ? proc.monit.memory : 0,
             cpu: proc.monit ? proc.monit.cpu : 0
         }));
-        res.json({ status: 'ok', services });
+
+        // NEW: Return installed plugins
+        const plugins = pluginManager.getPluginList();
+
+        res.json({ status: 'ok', services, plugins });
     } catch (e) {
         res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/v1/plugins/exec', requireAuth, async (req, res) => {
+    const { code, args } = req.body;
+    console.log(`[Plugin] Executing ${code}`);
+
+    try {
+        const result = await pluginManager.executePlugin(code, args);
+        res.json({ status: 'success', result });
+    } catch (e) {
+        console.error(`[Plugin Error]`, e);
+        res.status(500).json({ status: 'failed', message: e.message });
     }
 });
 
