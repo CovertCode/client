@@ -1,72 +1,107 @@
 import https from 'node:https';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
 import express from 'express';
 import helmet from 'helmet';
-import jwt from 'jsonwebtoken';
-import { TLS_CONFIG, ALLOWED_SERVICES, MASTER_PUBLIC_KEY, CLIENT_ID } from './config.js';
-import { getServicesStatus, runCommand } from './services/pm2_control.js';
+import pm2 from 'pm2';
+import { fileURLToPath } from 'url';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(helmet());
 app.use(express.json());
 
-// Middleware: Verify mTLS & JWT
-const requireAuth = (req, res, next) => {
-    // 1. mTLS Check (Transport Layer)
-    const cert = req.socket.getPeerCertificate();
-    if (!cert || !cert.subject) {
-        return res.status(401).json({ error: 'Client certificate required' });
-    }
-    // In production, verify cert.fingerprint against a known registry if needed
-    // or rely on 'rejectUnauthorized: true' + CA trust.
+// --- 1. KEY GENERATION SYSTEM ---
+const KEY_FILE = path.join(__dirname, 'key.json');
+let API_KEY;
 
-    // 2. JWT Check (Application Layer)
+if (fs.existsSync(KEY_FILE)) {
+    const data = JSON.parse(fs.readFileSync(KEY_FILE, 'utf-8'));
+    API_KEY = data.key;
+    console.log('\n==================================================');
+    console.log(' EXISTING KEY LOADED');
+    console.log(` Key: ${API_KEY}`);
+    console.log('==================================================\n');
+} else {
+    // Generate a secure random key
+    API_KEY = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(KEY_FILE, JSON.stringify({ key: API_KEY }));
+    console.log('\n==================================================');
+    console.log(' NEW SECURITY KEY GENERATED');
+    console.log(' Copy this key to your Master Manager:');
+    console.log(` Key: ${API_KEY}`);
+    console.log('==================================================\n');
+}
+
+// --- 2. AUTH MIDDLEWARE ---
+const requireAuth = (req, res, next) => {
     const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Missing JWT' });
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+        console.warn(`[Auth Failed] IP: ${req.ip}`);
+        return res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
     }
-    
-    const token = authHeader.split(' ')[1];
-    
-    try {
-        const decoded = jwt.verify(token, MASTER_PUBLIC_KEY, { 
-            audience: CLIENT_ID,
-            algorithms: ['RS256'] // Ensure strong algo
-        });
-        
-        // Replay attack protection (simple cache implementation omitted for brevity)
-        req.user = decoded;
-        next();
-    } catch (err) {
-        console.error('JWT Fail:', err.message);
-        return res.status(403).json({ error: 'Invalid Token' });
-    }
+    next();
 };
 
-// Routes
+// --- 3. PM2 WRAPPERS (No filtering) ---
+const pm2Call = (method, ...args) => new Promise((resolve, reject) => {
+    pm2.connect((err) => {
+        if (err) return reject(err);
+        pm2[method](...args, (err, data) => {
+            if (err) return reject(err);
+            resolve(data);
+        });
+    });
+});
+
+// --- 4. ROUTES ---
+
+// GET /health - Returns ALL services
 app.get('/health', requireAuth, async (req, res) => {
     try {
-        const services = await getServicesStatus(ALLOWED_SERVICES);
-        res.json({ status: 'ok', server_name: 'web-1', services });
+        const list = await pm2Call('list');
+
+        // Map simplified data for UI
+        const services = list.map(proc => ({
+            name: proc.name,
+            status: proc.pm2_env.status,
+            uptime: Date.now() - proc.pm2_env.pm_uptime,
+            memory: proc.monit ? proc.monit.memory : 0,
+            cpu: proc.monit ? proc.monit.cpu : 0
+        }));
+
+        res.json({ status: 'ok', services });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
 
+// POST /commands - Execute action on ANY service
 app.post('/api/v1/commands', requireAuth, async (req, res) => {
-    const { action, service, jti } = req.body;
-    
-    console.log(`[Audit] Action: ${action} on ${service} by ${req.user.sub} (JTI: ${jti})`);
+    const { action, service } = req.body;
+    console.log(`[Command] ${action} -> ${service}`);
 
     try {
-        await runCommand(action, service, ALLOWED_SERVICES);
+        if (!['start', 'stop', 'restart'].includes(action)) throw new Error('Invalid action');
+
+        await pm2Call(action, service);
         res.json({ status: 'success', service, action });
     } catch (e) {
         res.status(500).json({ status: 'failed', message: e.message });
     }
 });
 
-// Start Server
-const server = https.createServer(TLS_CONFIG, app);
-server.listen(8443, () => {
-    console.log('Client Service listening on port 8443 (mTLS enabled)');
+// --- 5. START SERVER (Self-Signed HTTPS) ---
+// We generate a temporary cert in memory or require a basic one. 
+// For simplicity, let's assume you still have the basic 'target-node.key/crt' 
+// OR generate them once. Using HTTP is unsafe for API Keys.
+const TLS_OPTS = {
+    key: fs.readFileSync('../certs/target-node.key'), // Keep the basic SSL certs
+    cert: fs.readFileSync('../certs/target-node.crt'),
+    // REMOVED: requestCert, rejectUnauthorized, ca (No mTLS)
+};
+
+https.createServer(TLS_OPTS, app).listen(8443, () => {
+    console.log('Client listening on port 8443 (HTTPS enabled, API Key protection active)');
 });
