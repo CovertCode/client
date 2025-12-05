@@ -1,113 +1,95 @@
-import path from 'node:path';
 import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
 import express from 'express'; // Pure Express
-import session from 'cookie-session';
+import helmet from 'helmet';
+import pm2 from 'pm2';
 import { fileURLToPath } from 'url';
-import argon2 from 'argon2';
-import { v4 as uuidv4 } from 'uuid';
-import db from './db.js';
-import * as remote from './services/remote_client.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
-// Configuration
-app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
-app.use(express.static(path.join(__dirname, 'public')));
+// Security Middleware
+app.use(helmet());
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// Session Config
-app.use(session({
-    name: 'session',
-    keys: ['your-secret-key'],
-    maxAge: 60 * 60 * 1000,
-    secure: false, // Set to TRUE when you switch to HTTPS
-    httpOnly: true,
-    sameSite: 'lax'
-}));
+// --- 1. KEY GENERATION (Shared Secret) ---
+const KEY_FILE = path.join(__dirname, 'key.json');
+let API_KEY;
 
-// Middleware
-const requireLogin = (req, res, next) => {
-    if (!req.session.userId) return res.redirect('/login');
+if (fs.existsSync(KEY_FILE)) {
+    const data = JSON.parse(fs.readFileSync(KEY_FILE, 'utf-8'));
+    API_KEY = data.key;
+    console.log('\n=== EXISTING KEY LOADED ===');
+    console.log(`Key: ${API_KEY}`);
+    console.log('===========================\n');
+} else {
+    API_KEY = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(KEY_FILE, JSON.stringify({ key: API_KEY }));
+    console.log('\n=== NEW KEY GENERATED ===');
+    console.log('Copy this to Master:');
+    console.log(`Key: ${API_KEY}`);
+    console.log('=========================\n');
+}
+
+// --- 2. AUTH MIDDLEWARE ---
+const requireAuth = (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
     next();
 };
 
-// --- ROUTES ---
+// --- 3. PM2 WRAPPERS ---
+const pm2Call = (method, ...args) => new Promise((resolve, reject) => {
+    pm2.connect((err) => {
+        if (err) return reject(err);
+        pm2[method](...args, (err, data) => {
+            if (err) return reject(err);
+            resolve(data);
+        });
+    });
+});
 
-// Login Routes
-app.get('/login', (req, res) => res.render('login', { error: null }));
-
-app.post('/login', async (req, res) => {
-    const { username, password } = req.body;
+// --- 4. ROUTES ---
+app.get('/health', requireAuth, async (req, res) => {
     try {
-        const user = db.prepare('SELECT * FROM admins WHERE username = ?').get(username);
-        if (user && await argon2.verify(user.password_hash, password)) {
-            req.session.userId = user.id;
-            req.session.username = user.username;
-            return res.redirect('/dashboard');
-        }
-        res.render('login', { error: 'Invalid credentials' });
+        const list = await pm2Call('list');
+        const services = list.map(proc => ({
+            name: proc.name,
+            status: proc.pm2_env.status,
+            uptime: Date.now() - proc.pm2_env.pm_uptime,
+            memory: proc.monit ? proc.monit.memory : 0,
+            cpu: proc.monit ? proc.monit.cpu : 0
+        }));
+        res.json({ status: 'ok', services });
     } catch (e) {
-        res.render('login', { error: 'Server error' });
+        res.status(500).json({ error: e.message });
     }
 });
 
-app.get('/logout', (req, res) => {
-    req.session = null;
-    res.redirect('/login');
-});
-
-// Dashboard
-app.get('/dashboard', requireLogin, async (req, res) => {
-    const clients = db.prepare('SELECT * FROM clients').all();
-    const clientsWithStatus = await Promise.all(clients.map(async (c) => {
-        const health = await remote.checkHealth(c);
-        return { ...c, health };
-    }));
-    res.render('dashboard', { clients: clientsWithStatus });
-});
-
-// Add Client
-app.get('/clients/add', requireLogin, (req, res) => res.render('add_client'));
-
-app.post('/clients/add', requireLogin, (req, res) => {
-    const { server_name, host, port, api_key } = req.body;
-    
-    // NOTE: When you switch to HTTPS, change this string to 'https://'
-    const apiUrl = `http://${host}:${port || 8443}`;
-    
+app.post('/api/v1/commands', requireAuth, async (req, res) => {
+    const { action, service } = req.body;
     try {
-        db.prepare('INSERT INTO clients (id, server_name, host, port, api_url, api_key) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(uuidv4(), server_name, host, port || 8443, apiUrl, api_key);
-        res.redirect('/dashboard');
+        await pm2Call(action, service);
+        res.json({ status: 'success', service, action });
     } catch (e) {
-        res.status(500).send(e.message);
+        res.status(500).json({ status: 'failed', message: e.message });
     }
 });
 
-// Remote Action
-app.post('/api/clients/:id/service/:service/:action', requireLogin, async (req, res) => {
-    const { id, service, action } = req.params;
-    const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(id);
-    if (!client) return res.status(404).json({ error: 'Not found' });
-
-    const result = await remote.sendCommand(client, action, service);
-    res.json(result);
-});
-
-// --- START SERVER ---
-const PORT = 3000;
+// --- 5. START SERVER ---
+const PORT = 8443;
 
 // CURRENT: HTTP Mode
 app.listen(PORT, () => {
-    console.log(`Master Manager running on http://localhost:${PORT}`);
+    console.log(`Client Node running on http://localhost:${PORT}`);
 });
 
 /* 
    FUTURE HTTPS SETUP:
    1. import https from 'node:https';
-   2. const opts = { key: ..., cert: ... };
-   3. https.createServer(opts, app).listen(443, ...);
+   2. const opts = { key: fs.readFileSync('key.pem'), cert: fs.readFileSync('cert.pem') };
+   3. https.createServer(opts, app).listen(PORT, ...);
 */
