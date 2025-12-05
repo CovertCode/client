@@ -1,107 +1,113 @@
-import https from 'node:https';
-import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
-import express from 'express';
-import helmet from 'helmet';
-import pm2 from 'pm2';
+import fs from 'node:fs';
+import express from 'express'; // Pure Express
+import session from 'cookie-session';
 import { fileURLToPath } from 'url';
+import argon2 from 'argon2';
+import { v4 as uuidv4 } from 'uuid';
+import db from './db.js';
+import * as remote from './services/remote_client.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-app.use(helmet());
+
+// Configuration
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
+app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// --- 1. KEY GENERATION SYSTEM ---
-const KEY_FILE = path.join(__dirname, 'key.json');
-let API_KEY;
+// Session Config
+app.use(session({
+    name: 'session',
+    keys: ['your-secret-key'],
+    maxAge: 60 * 60 * 1000,
+    secure: false, // Set to TRUE when you switch to HTTPS
+    httpOnly: true,
+    sameSite: 'lax'
+}));
 
-if (fs.existsSync(KEY_FILE)) {
-    const data = JSON.parse(fs.readFileSync(KEY_FILE, 'utf-8'));
-    API_KEY = data.key;
-    console.log('\n==================================================');
-    console.log(' EXISTING KEY LOADED');
-    console.log(` Key: ${API_KEY}`);
-    console.log('==================================================\n');
-} else {
-    // Generate a secure random key
-    API_KEY = crypto.randomBytes(32).toString('hex');
-    fs.writeFileSync(KEY_FILE, JSON.stringify({ key: API_KEY }));
-    console.log('\n==================================================');
-    console.log(' NEW SECURITY KEY GENERATED');
-    console.log(' Copy this key to your Master Manager:');
-    console.log(` Key: ${API_KEY}`);
-    console.log('==================================================\n');
-}
-
-// --- 2. AUTH MIDDLEWARE ---
-const requireAuth = (req, res, next) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
-        console.warn(`[Auth Failed] IP: ${req.ip}`);
-        return res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
-    }
+// Middleware
+const requireLogin = (req, res, next) => {
+    if (!req.session.userId) return res.redirect('/login');
     next();
 };
 
-// --- 3. PM2 WRAPPERS (No filtering) ---
-const pm2Call = (method, ...args) => new Promise((resolve, reject) => {
-    pm2.connect((err) => {
-        if (err) return reject(err);
-        pm2[method](...args, (err, data) => {
-            if (err) return reject(err);
-            resolve(data);
-        });
-    });
-});
+// --- ROUTES ---
 
-// --- 4. ROUTES ---
+// Login Routes
+app.get('/login', (req, res) => res.render('login', { error: null }));
 
-// GET /health - Returns ALL services
-app.get('/health', requireAuth, async (req, res) => {
+app.post('/login', async (req, res) => {
+    const { username, password } = req.body;
     try {
-        const list = await pm2Call('list');
-
-        // Map simplified data for UI
-        const services = list.map(proc => ({
-            name: proc.name,
-            status: proc.pm2_env.status,
-            uptime: Date.now() - proc.pm2_env.pm_uptime,
-            memory: proc.monit ? proc.monit.memory : 0,
-            cpu: proc.monit ? proc.monit.cpu : 0
-        }));
-
-        res.json({ status: 'ok', services });
+        const user = db.prepare('SELECT * FROM admins WHERE username = ?').get(username);
+        if (user && await argon2.verify(user.password_hash, password)) {
+            req.session.userId = user.id;
+            req.session.username = user.username;
+            return res.redirect('/dashboard');
+        }
+        res.render('login', { error: 'Invalid credentials' });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.render('login', { error: 'Server error' });
     }
 });
 
-// POST /commands - Execute action on ANY service
-app.post('/api/v1/commands', requireAuth, async (req, res) => {
-    const { action, service } = req.body;
-    console.log(`[Command] ${action} -> ${service}`);
+app.get('/logout', (req, res) => {
+    req.session = null;
+    res.redirect('/login');
+});
 
+// Dashboard
+app.get('/dashboard', requireLogin, async (req, res) => {
+    const clients = db.prepare('SELECT * FROM clients').all();
+    const clientsWithStatus = await Promise.all(clients.map(async (c) => {
+        const health = await remote.checkHealth(c);
+        return { ...c, health };
+    }));
+    res.render('dashboard', { clients: clientsWithStatus });
+});
+
+// Add Client
+app.get('/clients/add', requireLogin, (req, res) => res.render('add_client'));
+
+app.post('/clients/add', requireLogin, (req, res) => {
+    const { server_name, host, port, api_key } = req.body;
+    
+    // NOTE: When you switch to HTTPS, change this string to 'https://'
+    const apiUrl = `http://${host}:${port || 8443}`;
+    
     try {
-        if (!['start', 'stop', 'restart'].includes(action)) throw new Error('Invalid action');
-
-        await pm2Call(action, service);
-        res.json({ status: 'success', service, action });
+        db.prepare('INSERT INTO clients (id, server_name, host, port, api_url, api_key) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(uuidv4(), server_name, host, port || 8443, apiUrl, api_key);
+        res.redirect('/dashboard');
     } catch (e) {
-        res.status(500).json({ status: 'failed', message: e.message });
+        res.status(500).send(e.message);
     }
 });
 
-// --- 5. START SERVER (Self-Signed HTTPS) ---
-// We generate a temporary cert in memory or require a basic one. 
-// For simplicity, let's assume you still have the basic 'target-node.key/crt' 
-// OR generate them once. Using HTTP is unsafe for API Keys.
-// const TLS_OPTS = {
-//     key: fs.readFileSync('../certs/target-node.key'), // Keep the basic SSL certs
-//     cert: fs.readFileSync('../certs/target-node.crt'),
-//     // REMOVED: requestCert, rejectUnauthorized, ca (No mTLS)
-// };
+// Remote Action
+app.post('/api/clients/:id/service/:service/:action', requireLogin, async (req, res) => {
+    const { id, service, action } = req.params;
+    const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(id);
+    if (!client) return res.status(404).json({ error: 'Not found' });
 
-https.createServer(app).listen(8443, () => {
-    console.log('Client listening on port 8443 (HTTPS enabled, API Key protection active)');
+    const result = await remote.sendCommand(client, action, service);
+    res.json(result);
 });
+
+// --- START SERVER ---
+const PORT = 3000;
+
+// CURRENT: HTTP Mode
+app.listen(PORT, () => {
+    console.log(`Master Manager running on http://localhost:${PORT}`);
+});
+
+/* 
+   FUTURE HTTPS SETUP:
+   1. import https from 'node:https';
+   2. const opts = { key: ..., cert: ... };
+   3. https.createServer(opts, app).listen(443, ...);
+*/
